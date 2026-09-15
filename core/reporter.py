@@ -5,7 +5,7 @@ Exports terminal tables and professional Markdown incident reports.
 
 import json
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -13,6 +13,7 @@ from rich.text import Text
 
 from core.analyzer import FlowStats
 from core.dns_hunter import DNSFinding
+from core.zerologon_hunter import ZeroLogonSession
 
 
 BANNER = r"""
@@ -23,7 +24,7 @@ BANNER = r"""
  | |_) |  __/ (_| | (_| (_) | | | |___|  _  | |_| | | | | ||  __/ |   
  |____/ \___|\__,_|\___\___/|_| |_|   |_| |_|\__,_|_| |_|\__\___|_|   
 [/bold cyan]
-[dim]Advanced C2 Beaconing, JA3 Fingerprinting & DNS Tunneling Hunter v1.0[/dim]
+[dim]Advanced C2 Beaconing, ZeroLogon, JA3 & DNS Threat Hunter v1.1[/dim]
 """
 
 
@@ -40,13 +41,15 @@ class ThreatReporter:
         dns_findings: List[DNSFinding],
         ja3_matches: List[Dict[str, Any]],
         total_packets: int,
-        duration: float
+        duration: float,
+        zerologon_sessions: Optional[List[ZeroLogonSession]] = None
     ):
         self.console.print()
         
         # Summary Box
         critical_flows = [f for f in flows if f.threat_level in ["CRITICAL", "HIGH"]]
         suspicious_dns = [d for d in dns_findings if d.is_suspicious]
+        zerologon_exploited = [s for s in (zerologon_sessions or []) if s.is_exploited or s.all_zero_authentications > 0]
 
         summary_text = Text()
         summary_text.append(f"Total Packets: {total_packets:,}  |  ", style="bold white")
@@ -54,12 +57,45 @@ class ThreatReporter:
         summary_text.append(f"Capture Duration: {duration:.1f}s\n", style="bold white")
         summary_text.append(f"🚨 Critical/High Beacons: {len(critical_flows)}   ", style="bold red" if critical_flows else "bold green")
         summary_text.append(f"🔍 Suspicious DNS Domains: {len(suspicious_dns)}   ", style="bold yellow" if suspicious_dns else "bold green")
-        summary_text.append(f"🎯 Known JA3 Threat Matches: {len(ja3_matches)}", style="bold magenta" if ja3_matches else "bold green")
+        summary_text.append(f"🎯 Known JA3 Threat Matches: {len(ja3_matches)}   ", style="bold magenta" if ja3_matches else "bold green")
+        if zerologon_exploited:
+            summary_text.append(f"💥 ZeroLogon Attacks: {len(zerologon_exploited)}", style="blink bold white on red")
 
         self.console.print(Panel(summary_text, title="[bold white]Investigation Summary[/bold white]", border_style="blue"))
         self.console.print()
 
-        # 1. C2 Beaconing Flow Table
+        # 1. ZeroLogon (CVE-2020-1472) Table (If detected, show first as it is critical!)
+        if zerologon_exploited:
+            zl_table = Table(title="[bold white on red] 🚨 CVE-2020-1472 (ZeroLogon) Exploitation Detected 🚨 [/bold white on red]", header_style="bold red")
+            zl_table.add_column("Status", justify="center")
+            zl_table.add_column("Attacker IP", style="bold red")
+            zl_table.add_column("Target DC IP", style="bold cyan")
+            zl_table.add_column("Zero Challenges", justify="right")
+            zl_table.add_column("Auth Attempts", justify="right")
+            zl_table.add_column("Bypass (SUCCESS)", justify="center")
+            zl_table.add_column("Password Reset", justify="center")
+            zl_table.add_column("Impact / Severity", style="bold yellow")
+
+            for s in zerologon_exploited:
+                status = "[blink bold red]EXPLOITED[/blink bold red]" if s.is_exploited else "[bold orange1]ATTACK DETECTED[/bold orange1]"
+                bypass = "[bold green]YES[/bold green]" if s.auth_success_detected else "[dim]NO[/dim]"
+                pw_reset = "[bold red]YES (Opnum 30)[/bold red]" if s.password_resets > 0 else "[dim]NO[/dim]"
+                impact = "Domain Admin Takeover (DC Password Zeroed!)" if s.is_exploited else "Brute-force in progress"
+
+                zl_table.add_row(
+                    status,
+                    s.client_ip,
+                    s.server_ip,
+                    str(s.all_zero_challenges),
+                    str(s.all_zero_authentications),
+                    bypass,
+                    pw_reset,
+                    impact
+                )
+            self.console.print(zl_table)
+            self.console.print()
+
+        # 2. C2 Beaconing Flow Table
         table = Table(title="[bold red]Detected Potential C2 Beaconing Flows[/bold red]", header_style="bold magenta")
         table.add_column("Threat Level", justify="center")
         table.add_column("Client IP", style="cyan")
@@ -106,7 +142,7 @@ class ThreatReporter:
             self.console.print(table)
             self.console.print()
 
-        # 2. Known JA3 Matches Table
+        # 3. Known JA3 Matches Table
         if ja3_matches:
             ja3_table = Table(title="[bold magenta]Known C2 / Threat JA3 Fingerprints[/bold magenta]", header_style="bold cyan")
             ja3_table.add_column("Client IP", style="cyan")
@@ -126,7 +162,7 @@ class ThreatReporter:
             self.console.print(ja3_table)
             self.console.print()
 
-        # 3. DNS Anomalies Table
+        # 4. DNS Anomalies Table
         if suspicious_dns:
             dns_table = Table(title="[bold yellow]Suspicious DNS Queries (Tunneling / DGA)[/bold yellow]", header_style="bold yellow")
             dns_table.add_column("Domain", style="bold cyan")
@@ -153,35 +189,55 @@ class ThreatReporter:
         flows: List[FlowStats],
         dns_findings: List[DNSFinding],
         ja3_matches: List[Dict[str, Any]],
-        pcap_file: str
+        pcap_file: str,
+        zerologon_sessions: Optional[List[ZeroLogonSession]] = None
     ):
         """Exports an enterprise-grade Markdown SOC Incident Report."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         critical_flows = [f for f in flows if f.threat_level in ["CRITICAL", "HIGH"]]
         suspicious_dns = [d for d in dns_findings if d.is_suspicious]
+        zerologon_exploited = [s for s in (zerologon_sessions or []) if s.is_exploited or s.all_zero_authentications > 0]
 
         md = f"""# 🛡️ BeaconHunter Forensics & Threat Hunting Report
 **Generated on:** {now}  
-**Source PCAP:** `{pcap_file}`  
+**Source Source:** `{pcap_file}`  
 
 ---
 
 ## 1. Executive Summary
 
-BeaconHunter analyzed the provided packet capture for automated Command-and-Control (C2) heartbeats, periodic beaconing heuristics, known malicious JA3 TLS fingerprints, and DNS data tunneling/exfiltration.
+BeaconHunter analyzed the provided traffic capture for automated Command-and-Control (C2) heartbeats, periodic beaconing heuristics, Netlogon privilege escalation exploits (ZeroLogon CVE-2020-1472), known malicious JA3 TLS fingerprints, and DNS data exfiltration.
 
+* **ZeroLogon (CVE-2020-1472) Exploits:** `{len(zerologon_exploited)}`
 * **High/Critical C2 Beacons Detected:** `{len(critical_flows)}`
 * **Suspicious DNS Queries (Tunneling/DGA):** `{len(suspicious_dns)}`
 * **Known Malicious JA3 Matches:** `{len(ja3_matches)}`
 
 ### MITRE ATT&CK® Mapping
+* **T1068 - Exploitation for Privilege Escalation** (ZeroLogon CVE-2020-1472)
+* **T1210 - Exploitation of Remote Services** (MS-NRPC Netlogon Auth Bypass)
 * **T1071.001 - Application Layer Protocol: Web Protocols** (Periodic HTTP/HTTPS Beaconing)
 * **T1071.004 - Application Layer Protocol: DNS** (High-entropy queries & data exfiltration)
-* **T1573 - Encrypted Channel** (Symmetric/Asymmetric C2 encryption & JA3 profiling)
+* **T1573 - Encrypted Channel** (JA3 TLS profiling)
 
 ---
+"""
 
-## 2. Critical & High Periodic Flows (C2 Candidates)
+        if zerologon_exploited:
+            md += """## 2. 🚨 Critical Threat: CVE-2020-1472 (ZeroLogon) Detected
+
+| Status | Attacker IP | Target DC IP | Zero Challenges | Auth Attempts | Bypass (SUCCESS) | Password Reset | Impact |
+| :---: | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+"""
+            for s in zerologon_exploited:
+                status_md = "**EXPLOITED**" if s.is_exploited else "ATTACK DETECTED"
+                bypass_md = "YES" if s.auth_success_detected else "NO"
+                pw_md = "YES (Opnum 30)" if s.password_resets > 0 else "NO"
+                impact_md = "Full Domain Compromise (DC Machine Account Password Zeroed)" if s.is_exploited else "Auth Brute-force in progress"
+                md += f"| **{status_md}** | `{s.client_ip}` | `{s.server_ip}` | {s.all_zero_challenges} | {s.all_zero_authentications} | {bypass_md} | {pw_md} | {impact_md} |\n"
+            md += "\n---\n\n"
+
+        md += """## 3. Critical & High Periodic Flows (C2 Candidates)
 
 | Threat Level | Source IP | Destination | Proto | Pulses | Mean Interval | Jitter (%) | Beacon Score | Indicators |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -193,7 +249,7 @@ BeaconHunter analyzed the provided packet capture for automated Command-and-Cont
         if not critical_flows:
             md += "| *None* | - | - | - | - | - | - | - | No critical periodic flows detected |\n"
 
-        md += "\n---\n\n## 3. Known JA3 TLS Fingerprint Matches\n\n"
+        md += "\n---\n\n## 4. Known JA3 TLS Fingerprint Matches\n\n"
         if ja3_matches:
             md += "| Client IP | Destination | JA3 Hash | Identified Threat | Description |\n| :--- | :--- | :--- | :--- | :--- |\n"
             for m in ja3_matches:
@@ -201,7 +257,7 @@ BeaconHunter analyzed the provided packet capture for automated Command-and-Cont
         else:
             md += "*No matching malicious JA3 fingerprints detected.*\n"
 
-        md += "\n---\n\n## 4. Suspicious DNS Activity (Tunneling & DGA)\n\n"
+        md += "\n---\n\n## 5. Suspicious DNS Activity (Tunneling & DGA)\n\n"
         if suspicious_dns:
             md += "| Base Domain | Queries | Max Entropy | Max Subdomain Length | Observed Anomalies |\n| :--- | :---: | :---: | :---: | :--- |\n"
             for d in suspicious_dns:
@@ -209,7 +265,7 @@ BeaconHunter analyzed the provided packet capture for automated Command-and-Cont
         else:
             md += "*No high-entropy or anomalous DNS queries detected.*\n"
 
-        md += "\n---\n*Report compiled by BeaconHunter v1.0 - Author: Said Hamidovic*\n"
+        md += "\n---\n*Report compiled by BeaconHunter v1.1 - Author: Said Hamidovic*\n"
 
         with open(output_file, "w") as f:
             f.write(md)
