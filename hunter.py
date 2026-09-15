@@ -4,6 +4,12 @@ BeaconHunter - Dual-Mode Network Threat Hunting & Intrusion Detection Engine.
 Supports:
 1. Offline PCAP Forensics (--pcap / positional argument)
 2. Live Real-Time Network Sniffing & Exploitation Alerting (--sniff / -i)
+Features:
+- Exploit-DB & Known CVE Signature Engine (Log4Shell, EternalBlue, PrintNightmare, Spring4Shell, Shells)
+- ZeroLogon (CVE-2020-1472 / MS-NRPC) Deep Protocol Inspection
+- Statistical C2 Beaconing Heuristics (Cobalt Strike, Sliver, Havoc)
+- TLS Client Hello JA3 Fingerprinting
+- High-Entropy DNS Tunneling / Exfiltration Detector
 Author: Said Hamidovic
 """
 
@@ -28,17 +34,19 @@ from core.analyzer import BeaconAnalyzer, FlowStats
 from core.ja3 import extract_ja3_from_raw, lookup_ja3
 from core.dns_hunter import DNSHunter
 from core.zerologon_hunter import ZeroLogonHunter
+from core.signature_engine import ExploitSignatureEngine, ExploitMatch
 from core.reporter import ThreatReporter
 
 
 class ThreatHunterEngine:
-    def __init__(self, reporter: ThreatReporter, live_mode: bool = False):
+    def __init__(self, reporter: ThreatReporter, live_mode: bool = False, rules_file: Optional[str] = None):
         self.reporter = reporter
         self.live_mode = live_mode
         self.flows: Dict[tuple, FlowStats] = {}
         self.dns_hunter = DNSHunter()
         self.ja3_matches: List[Dict[str, Any]] = []
         self.zerologon_hunter = ZeroLogonHunter(alert_callback=self._live_alert)
+        self.exploit_engine = ExploitSignatureEngine(rules_file=rules_file, alert_callback=self._live_alert)
         self.packet_count = 0
         self.first_ts = None
         self.last_ts = None
@@ -48,6 +56,7 @@ class ThreatHunterEngine:
         now = datetime.now().strftime("%H:%M:%S")
         prefix_map = {
             "CRITICAL": "[bold white on red] 🚨 CRITICAL [/bold white on red]",
+            "HIGH": "[bold white on red] ⚔️ EXPLOIT [/bold white on red]",
             "WARNING": "[bold black on yellow] ⚠️  WARNING [/bold black on yellow]",
             "SUCCESS": "[bold white on green] ✔️  SUCCESS [/bold white on green]",
             "INFO": "[bold white on blue] ℹ️  INFO [/bold white on blue]"
@@ -79,41 +88,50 @@ class ThreatHunterEngine:
             dst_port = pkt[TCP].dport
             payload = bytes(pkt[TCP].payload)
 
-            # 1. ZeroLogon (CVE-2020-1472 / MS-NRPC) Inspection
-            if dst_port in [445, 135] or src_port in [445, 135] or len(payload) > 16:
-                self.zerologon_hunter.process_packet(src_ip, dst_ip, src_port, dst_port, payload, ts)
+            if payload:
+                # 1. Exploit-DB & CVE Signature Inspection
+                self.exploit_engine.inspect_payload(src_ip, dst_ip, src_port, dst_port, "TCP", payload, ts)
 
-            # 2. TLS Client Hello / JA3 Inspection
-            if dst_port in [443, 8443] or len(payload) > 5:
-                ja3_hash = extract_ja3_from_raw(payload)
-                if ja3_hash:
-                    match = lookup_ja3(ja3_hash)
-                    if match:
-                        record = {
-                            "src_ip": src_ip,
-                            "dst_ip": dst_ip,
-                            "dst_port": dst_port,
-                            "hash": ja3_hash,
-                            "threat": match[0],
-                            "desc": match[1]
-                        }
-                        if record not in self.ja3_matches:
-                            self.ja3_matches.append(record)
-                            if self.live_mode:
-                                self._live_alert("WARNING", f"Malicious JA3 Fingerprint: {match[0]} ({match[1]}) from {src_ip} -> {dst_ip}")
+                # 2. ZeroLogon (CVE-2020-1472 / MS-NRPC) Deep Inspection
+                if dst_port in [445, 135] or src_port in [445, 135] or len(payload) > 16:
+                    self.zerologon_hunter.process_packet(src_ip, dst_ip, src_port, dst_port, payload, ts)
+
+                # 3. TLS Client Hello / JA3 Inspection
+                if dst_port in [443, 8443] or len(payload) > 5:
+                    ja3_hash = extract_ja3_from_raw(payload)
+                    if ja3_hash:
+                        match = lookup_ja3(ja3_hash)
+                        if match:
+                            record = {
+                                "src_ip": src_ip,
+                                "dst_ip": dst_ip,
+                                "dst_port": dst_port,
+                                "hash": ja3_hash,
+                                "threat": match[0],
+                                "desc": match[1]
+                            }
+                            if record not in self.ja3_matches:
+                                self.ja3_matches.append(record)
+                                if self.live_mode:
+                                    self._live_alert("WARNING", f"Malicious JA3 Fingerprint: {match[0]} ({match[1]}) from {src_ip} -> {dst_ip}")
 
         elif pkt.haslayer(UDP):
             proto_name = "UDP"
             src_port = pkt[UDP].sport
             dst_port = pkt[UDP].dport
+            payload = bytes(pkt[UDP].payload)
 
-            # 3. DNS Tunneling & Exfiltration Inspection
+            if payload:
+                # Inspect UDP payload for exploits (e.g. UDP-based RCE)
+                self.exploit_engine.inspect_payload(src_ip, dst_ip, src_port, dst_port, "UDP", payload, ts)
+
+            # 4. DNS Tunneling & Exfiltration Inspection
             if pkt.haslayer(DNS) and pkt.haslayer(DNSQR):
                 qname = pkt[DNSQR].qname.decode("utf-8", errors="ignore")
                 finding = self.dns_hunter.process_query(src_ip, qname)
                 if finding and finding.is_suspicious and self.live_mode:
                     if finding.query_count in [1, 10, 25, 50]:
-                        self._live_alert("WARNING", f"DNS Tunneling / High Entropy detected for domain: [bold cyan]{finding.domain}[/bold cyan] ({finding.max_entropy} entropy)")
+                        self._live_alert("WARNING", f"DNS Tunneling / High Entropy detected: [bold cyan]{finding.domain}[/bold cyan] ({finding.max_entropy} entropy)")
 
         # Aggregate flow for Beaconing analysis
         flow_key = (src_ip, dst_ip, dst_port, proto_name)
@@ -136,7 +154,8 @@ def run_pcap_mode(pcap_path: str, args, reporter: ThreatReporter):
         reporter.console.print(f"[bold red][!] Error:[/bold red] PCAP file '{pcap_path}' not found.")
         sys.exit(1)
 
-    engine = ThreatHunterEngine(reporter, live_mode=False)
+    engine = ThreatHunterEngine(reporter, live_mode=False, rules_file=args.rules)
+    reporter.console.print(f"[bold cyan][*] Loaded Exploit Signatures:[/bold cyan] [bold yellow]{len(engine.exploit_engine.rules)} active CVE / Exploit-DB rules[/bold yellow]")
     reporter.console.print(f"[bold cyan][*] Ingesting and parsing offline PCAP:[/bold cyan] [bold]{pcap_path}[/bold]...")
 
     try:
@@ -156,8 +175,9 @@ def run_live_sniff_mode(interface: Optional[str], bpf_filter: Optional[str], arg
     if not interface:
         interface = str(conf.iface)
 
-    engine = ThreatHunterEngine(reporter, live_mode=True)
-    reporter.console.print(f"[bold green][*] Mode:[/bold green] [bold white]LIVE NETWORK SNIFFING & THREAT DETECTION[/bold white]")
+    engine = ThreatHunterEngine(reporter, live_mode=True, rules_file=args.rules)
+    reporter.console.print(f"[bold green][*] Mode:[/bold green] [bold white]LIVE NETWORK SNIFFING & REAL-TIME THREAT DETECTION[/bold white]")
+    reporter.console.print(f"[bold cyan][*] Loaded Exploit Signatures:[/bold cyan] [bold yellow]{len(engine.exploit_engine.rules)} active CVE / Exploit-DB rules[/bold yellow]")
     reporter.console.print(f"[bold cyan][*] Listening on interface:[/bold cyan] [bold yellow]{interface}[/bold yellow]")
     if bpf_filter:
         reporter.console.print(f"[bold cyan][*] BPF Filter:[/bold cyan] [bold]{bpf_filter}[/bold]")
@@ -193,6 +213,7 @@ def finalize_results(engine: ThreatHunterEngine, source_name: str, args, reporte
     analyzed_flows = [analyzer.analyze_flow(f) for f in engine.flows.values()]
     dns_results = list(engine.dns_hunter.domains.values())
     zl_sessions = list(engine.zerologon_hunter.sessions.values())
+    exploit_hits = engine.exploit_engine.matches
 
     # Display final results
     reporter.display_results(
@@ -201,7 +222,8 @@ def finalize_results(engine: ThreatHunterEngine, source_name: str, args, reporte
         ja3_matches=engine.ja3_matches,
         total_packets=engine.packet_count,
         duration=duration,
-        zerologon_sessions=zl_sessions
+        zerologon_sessions=zl_sessions,
+        exploit_matches=exploit_hits
     )
 
     # Export Markdown Report
@@ -212,7 +234,8 @@ def finalize_results(engine: ThreatHunterEngine, source_name: str, args, reporte
             dns_findings=dns_results,
             ja3_matches=engine.ja3_matches,
             pcap_file=source_name,
-            zerologon_sessions=zl_sessions
+            zerologon_sessions=zl_sessions,
+            exploit_matches=exploit_hits
         )
 
     # Export JSON
@@ -224,6 +247,20 @@ def finalize_results(engine: ThreatHunterEngine, source_name: str, args, reporte
                 "duration_seconds": duration,
                 "flows_count": len(analyzed_flows),
             },
+            "exploit_matches": [
+                {
+                    "rule_id": m.rule_id,
+                    "cve": m.cve,
+                    "edb_id": m.edb_id,
+                    "name": m.name,
+                    "severity": m.severity,
+                    "attacker": f"{m.src_ip}:{m.src_port}",
+                    "target": f"{m.dst_ip}:{m.dst_port}",
+                    "mitre_attack": m.mitre_attack,
+                    "snippet": m.snippet
+                }
+                for m in exploit_hits
+            ],
             "zerologon_attacks": [
                 {
                     "attacker_ip": s.client_ip,
@@ -269,19 +306,20 @@ def finalize_results(engine: ThreatHunterEngine, source_name: str, args, reporte
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BeaconHunter - Dual-Mode Threat Hunter (C2 Beaconing, ZeroLogon CVE-2020-1472, JA3, DNS)",
+        description="BeaconHunter - Network Threat Hunter & Exploit-DB / CVE Detection Engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  1. Offline PCAP Analysis:\n"
-               "     python hunter.py samples/c2_traffic.pcap --export-md report.md\n\n"
+               "     python hunter.py samples/c2_traffic_sample.pcap --export-md report.md\n\n"
                "  2. Live Sniffing & Real-Time Alerting (requires sudo):\n"
                "     sudo python hunter.py --sniff -i eth0\n"
-               "     sudo python hunter.py --sniff -i eth0 --bpf 'tcp port 445 or tcp port 135'\n"
+               "     sudo python hunter.py --sniff -i eth0 --bpf 'tcp port 445 or tcp port 8080'\n"
     )
     parser.add_argument("pcap", nargs="?", help="Path to PCAP / PCAPNG packet capture file (for offline mode)")
     parser.add_argument("--sniff", "--live", action="store_true", help="Enable active live network sniffing mode")
     parser.add_argument("-i", "--interface", help="Network interface for live sniffing (e.g. eth0, en0, wlan0)")
     parser.add_argument("--bpf", help="BPF filter for live sniffing (e.g. 'tcp port 445 or udp port 53')")
+    parser.add_argument("--rules", help="Path to custom JSON exploit signature file (defaults to rules/exploit_signatures.json)")
     parser.add_argument("--threshold", type=float, default=40.0, help="Minimum beacon score to display (0-100, default: 40.0)")
     parser.add_argument("--export-md", help="Export findings to a professional Markdown incident report")
     parser.add_argument("--json", help="Export raw analysis findings to a JSON file")
@@ -297,7 +335,6 @@ def main():
     elif args.pcap:
         run_pcap_mode(args.pcap, args, reporter)
     else:
-        # Show help and interface list if no arguments given
         reporter.console.print("[bold yellow][!] No input specified.[/bold yellow] Provide a PCAP file or use '--sniff' for live monitoring.")
         reporter.console.print(f"[dim]Available network interfaces: {', '.join(get_if_list())}[/dim]\n")
         parser.print_help()

